@@ -1,0 +1,352 @@
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using WMS.Domain.Entities;
+using WMS.Domain.Interfaces;
+using WMS.Infrastructure.Persistence;
+
+namespace WMS.Infrastructure.Repositories;
+
+public class RentalAreaRepository : IRentalAreaRepository
+{
+    private readonly ApplicationDbContext _context;
+
+    public RentalAreaRepository(ApplicationDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<int> CreateAsync(RentalArea rentalArea, CancellationToken cancellationToken)
+    {
+        await _context.RentalAreas.AddAsync(rentalArea, cancellationToken);
+        await _context.SaveChangesAsync(cancellationToken);
+        return rentalArea.Id;
+    }
+
+    public async Task<RentalArea?> GetByIdAsync(int id, CancellationToken cancellationToken)
+    {
+        return await _context.RentalAreas
+            .FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+    }
+
+    public async Task<List<RentalArea>> GetByWarehouseIdAsync(int warehouseId, CancellationToken cancellationToken)
+    {
+        return await _context.RentalAreas
+            .Where(r => r.WarehouseId == warehouseId)
+            .ToListAsync(cancellationToken);
+    }
+
+    private static readonly HashSet<string> OccupiedStatuses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ACTIVE"
+    };
+
+    public async Task<List<RentalArea>> GetWithOccupancyByWarehouseIdAsync(int warehouseId, CancellationToken cancellationToken)
+    {
+        var areas = await _context.RentalAreas
+            .Where(a => a.WarehouseId == warehouseId)
+            .ToListAsync(cancellationToken);
+
+        // Join rental_requests + contracts to find occupied areas and custom mapped areas
+        var occupied = await _context.Contracts
+            .Where(c => OccupiedStatuses.Contains(c.Status) && c.WarehouseId == warehouseId)
+            .Join(_context.RentalRequests,
+                c => c.RequestId,
+                r => r.RequestId,
+                (c, r) => new { 
+                    c.ContractId, 
+                    r.RentalAreaId,
+                    r.BaseRentalAreaId,
+                    r.IsCustomArea,
+                    r.ProposedPositionX,
+                    r.ProposedPositionY,
+                    r.ProposedWidth,
+                    r.ProposedLength,
+                    // Extension zone (L-shape)
+                    r.HasExtensionZone,
+                    r.ExtensionPositionX,
+                    r.ExtensionPositionY,
+                    r.ExtensionWidth,
+                    r.ExtensionLength,
+                    // Multi-zone
+                    r.AdditionalZonesJson
+                })
+            .ToListAsync(cancellationToken);
+
+        var resultAreas = new List<RentalArea>();
+        var baseAreasToRemove = new HashSet<int>();
+
+        // 1. Regular occupied full-areas
+        var fullOccupiedMap = occupied
+            .Where(x => x.RentalAreaId != null && !x.IsCustomArea)
+            .GroupBy(x => x.RentalAreaId!.Value)
+            .ToDictionary(g => g.Key, g => g.First().ContractId);
+
+        // 1b. Auto-selected areas from additionalZonesJson
+        // Format: [{"x":0,"y":10,"w":10,"l":10,"areaId":19}, ...]
+        // Items with areaId > 0 are auto-selected existing areas
+        var autoSelectedMap = new Dictionary<int, int>(); // areaId -> contractId
+        foreach (var occ in occupied)
+        {
+            if (string.IsNullOrEmpty(occ.AdditionalZonesJson)) continue;
+            try
+            {
+                using var doc = JsonDocument.Parse(occ.AdditionalZonesJson);
+                var root = doc.RootElement;
+
+                // Format 1: Direct array of zone objects
+                if (root.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var zoneEl in root.EnumerateArray())
+                    {
+                        if (zoneEl.TryGetProperty("areaId", out var aidEl) && aidEl.TryGetInt32(out var areaId) && areaId != 0)
+                        {
+                            if (!autoSelectedMap.ContainsKey(areaId))
+                                autoSelectedMap[areaId] = occ.ContractId;
+                        }
+                    }
+                }
+                // Format 2: Object with autoSelectedAreaIds array (legacy)
+                else if (root.ValueKind == JsonValueKind.Object &&
+                         root.TryGetProperty("autoSelectedAreaIds", out var idsEl) &&
+                         idsEl.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var idEl in idsEl.EnumerateArray())
+                    {
+                        if (idEl.TryGetInt32(out var areaId) && areaId != 0 && !autoSelectedMap.ContainsKey(areaId))
+                            autoSelectedMap[areaId] = occ.ContractId;
+                    }
+                }
+            }
+            catch { /* malformed JSON – skip */ }
+        }
+
+        // 2. Custom mapped areas (splits)
+        var customSplits = occupied
+            .Where(x => x.IsCustomArea && x.BaseRentalAreaId != null)
+            .ToList();
+
+        foreach (var area in areas)
+        {
+            if (fullOccupiedMap.TryGetValue(area.Id, out var cid))
+            {
+                area.IsOccupied = true;
+                area.ActiveContractId = cid;
+                resultAreas.Add(area);
+                continue;
+            }
+
+            // Check if this area is auto-selected via additionalZonesJson
+            if (autoSelectedMap.TryGetValue(area.Id, out var autoContractId))
+            {
+                area.IsOccupied = true;
+                area.ActiveContractId = autoContractId;
+                resultAreas.Add(area);
+                continue;
+            }
+
+            var customSplit = customSplits.FirstOrDefault(x => x.BaseRentalAreaId == area.Id);
+            if (customSplit != null)
+            {
+                baseAreasToRemove.Add(area.Id);
+                
+                double height = ((area.Width ?? 0) > 0 && (area.Length ?? 0) > 0) 
+                    ? (area.Size) / ((area.Width ?? 1) * (area.Length ?? 1)) 
+                    : 5.0;
+
+                // Add Khu A (Occupied)
+                // Use a negative deterministic ID so React maps uniquely (e.g., -100 * area.Id)
+                var areaA = new RentalArea
+                {
+                    Id = -(area.Id * 100),
+                    WarehouseId = area.WarehouseId,
+                    Name = area.Name + "A",
+                    PositionX = customSplit.ProposedPositionX ?? area.PositionX,
+                    PositionY = customSplit.ProposedPositionY ?? area.PositionY,
+                    Width = customSplit.ProposedWidth ?? area.Width,
+                    Length = customSplit.ProposedLength ?? area.Length,
+                    Size = (customSplit.ProposedWidth ?? 0) * (customSplit.ProposedLength ?? 0) * height,
+                    IsOccupied = true,
+                    ActiveContractId = customSplit.ContractId,
+                    Description = area.Description
+                };
+                resultAreas.Add(areaA);
+
+                // Add Khu B (Remaining Available)
+                bool isFullWidth = (customSplit.ProposedWidth ?? 0) == (area.Width ?? 0);
+                bool isFullLength = (customSplit.ProposedLength ?? 0) == (area.Length ?? 0);
+                bool isTopAligned = (customSplit.ProposedPositionY ?? 0) == (area.PositionY ?? 0);
+                bool isLeftAligned = (customSplit.ProposedPositionX ?? 0) == (area.PositionX ?? 0);
+
+                var areaB = new RentalArea
+                {
+                    Id = -(area.Id * 100 + 1),
+                    WarehouseId = area.WarehouseId,
+                    Name = area.Name + "B",
+                    IsOccupied = false,
+                    ActiveContractId = null,
+                    Description = area.Description
+                };
+
+                if (isFullWidth && !isFullLength)
+                {
+                    areaB.Width = area.Width;
+                    areaB.Length = area.Length - customSplit.ProposedLength;
+                    areaB.PositionX = area.PositionX;
+                    areaB.PositionY = isTopAligned 
+                        ? area.PositionY + customSplit.ProposedLength 
+                        : area.PositionY;
+                    areaB.Size = (areaB.Width ?? 0) * (areaB.Length ?? 0) * height;
+                }
+                else if (isFullLength && !isFullWidth)
+                {
+                    areaB.Width = area.Width - customSplit.ProposedWidth;
+                    areaB.Length = area.Length;
+                    areaB.PositionY = area.PositionY;
+                    areaB.PositionX = isLeftAligned 
+                        ? area.PositionX + customSplit.ProposedWidth 
+                        : area.PositionX;
+                    areaB.Size = (areaB.Width ?? 0) * (areaB.Length ?? 0) * height;
+                }
+
+                if ((areaB.Size) > 0)
+                {
+                    // Check if Khu B is also auto-selected via additionalZonesJson
+                    if (autoSelectedMap.TryGetValue(areaB.Id, out var areaBContractId))
+                    {
+                        areaB.IsOccupied = true;
+                        areaB.ActiveContractId = areaBContractId;
+                    }
+                    resultAreas.Add(areaB);
+                }
+                continue;
+            }
+
+            // Normal unoccupied area
+            resultAreas.Add(area);
+        }
+
+        // 3. Independent custom areas (BaseRentalAreaId == null)
+        var independentCustoms = occupied
+            .Where(x => x.IsCustomArea && x.BaseRentalAreaId == null)
+            .ToList();
+
+        if (independentCustoms.Any())
+        {
+            // Compute actual warehouse height instead of hardcoding
+            var wh = await _context.Warehouses
+                .Where(w => w.WarehouseId == warehouseId)
+                .Select(w => new { w.Width, w.Length, w.TotalArea })
+                .FirstOrDefaultAsync(cancellationToken);
+
+            double whHeight = (wh != null && (wh.Width ?? 0) > 0 && (wh.Length ?? 0) > 0 && wh.TotalArea > 0)
+                ? wh.TotalArea / ((wh.Width ?? 1) * (wh.Length ?? 1))
+                : 4.0;
+
+            foreach (var custom in independentCustoms)
+            {
+                // Primary zone
+                var customArea = new RentalArea
+                {
+                    Id = -(custom.ContractId * 10000),
+                    WarehouseId = warehouseId,
+                    Name = "Khu đã thuê",
+                    PositionX = custom.ProposedPositionX ?? 0,
+                    PositionY = custom.ProposedPositionY ?? 0,
+                    Width = custom.ProposedWidth,
+                    Length = custom.ProposedLength,
+                    Size = (custom.ProposedWidth ?? 0) * (custom.ProposedLength ?? 0) * whHeight,
+                    IsOccupied = true,
+                    ActiveContractId = custom.ContractId,
+                    Description = "Khu vực do chủ kho sắp xếp"
+                };
+                resultAreas.Add(customArea);
+
+                // Extension zone (L-shape second rectangle)
+                if (custom.HasExtensionZone && (custom.ExtensionWidth ?? 0) > 0 && (custom.ExtensionLength ?? 0) > 0)
+                {
+                    var extArea = new RentalArea
+                    {
+                        Id = -(custom.ContractId * 10000 + 1),
+                        WarehouseId = warehouseId,
+                        Name = "Khu đã thuê (mở rộng)",
+                        PositionX = custom.ExtensionPositionX ?? 0,
+                        PositionY = custom.ExtensionPositionY ?? 0,
+                        Width = custom.ExtensionWidth,
+                        Length = custom.ExtensionLength,
+                        Size = (custom.ExtensionWidth ?? 0) * (custom.ExtensionLength ?? 0) * whHeight,
+                        IsOccupied = true,
+                        ActiveContractId = custom.ContractId,
+                        Description = "Phần mở rộng L-shape"
+                    };
+                    resultAreas.Add(extArea);
+                }
+            }
+        }
+
+        return resultAreas;
+    }
+
+    public async Task UpdateAsync(RentalArea rentalArea, CancellationToken cancellationToken)
+    {
+        _context.RentalAreas.Update(rentalArea);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task DeleteAsync(RentalArea rentalArea, CancellationToken cancellationToken)
+    {
+        // Null-out all FK references to avoid constraint violations
+        // 1. rental_requests.RentalAreaId
+        var linkedRequests = await _context.RentalRequests
+            .Where(r => r.RentalAreaId == rentalArea.Id)
+            .ToListAsync(cancellationToken);
+        foreach (var req in linkedRequests)
+            req.RentalAreaId = null;
+
+        // 2. equipments.RentalAreaId
+        var linkedEquipment = await _context.Equipments
+            .Where(e => e.RentalAreaId == rentalArea.Id)
+            .ToListAsync(cancellationToken);
+        foreach (var eq in linkedEquipment)
+            eq.RentalAreaId = null;
+
+        // 3. equipment_histories.PreviousRentalAreaId / NewRentalAreaId
+        var linkedHistory = await _context.EquipmentHistories
+            .Where(h => h.PreviousRentalAreaId == rentalArea.Id || h.NewRentalAreaId == rentalArea.Id)
+            .ToListAsync(cancellationToken);
+        foreach (var h in linkedHistory)
+        {
+            if (h.PreviousRentalAreaId == rentalArea.Id) h.PreviousRentalAreaId = null;
+            if (h.NewRentalAreaId == rentalArea.Id) h.NewRentalAreaId = null;
+        }
+
+        _context.RentalAreas.Remove(rentalArea);
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task<double> GetTotalAllocatedAreaAsync(int warehouseId, CancellationToken cancellationToken)
+    {
+        return await _context.RentalAreas
+            .Where(r => r.WarehouseId == warehouseId)
+            .SumAsync(r => r.Size, cancellationToken);
+    }
+
+    public async Task<double> GetTotalAllocatedFloorAreaAsync(int warehouseId, CancellationToken cancellationToken)
+    {
+        var areas = await _context.RentalAreas
+            .Where(r => r.WarehouseId == warehouseId && r.Width.HasValue && r.Length.HasValue)
+            .Select(r => new { r.Width, r.Length })
+            .ToListAsync(cancellationToken);
+        return areas.Sum(r => (r.Width ?? 0) * (r.Length ?? 0));
+    }
+
+    public async Task<bool> IsAreaOccupiedAsync(int id, CancellationToken cancellationToken)
+    {
+        return await _context.Contracts
+            .Where(c => OccupiedStatuses.Contains(c.Status))
+            .Join(_context.RentalRequests,
+                c => c.RequestId,
+                r => r.RequestId,
+                (c, r) => r.RentalAreaId)
+            .AnyAsync(areaId => areaId == id, cancellationToken);
+    }
+}

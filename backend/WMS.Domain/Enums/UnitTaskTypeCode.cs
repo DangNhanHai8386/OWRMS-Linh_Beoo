@@ -1,0 +1,12 @@
+namespace WMS.Domain.Enums;
+
+public enum UnitTaskTypeCode
+{
+    INBOUND_APPROVE,
+    INBOUND_RECEIVE,
+    INBOUND_PUTAWAY,
+
+    OUTBOUND_APPROVE,
+    OUTBOUND_PICK,
+    OUTBOUND_DISPATCH
+}

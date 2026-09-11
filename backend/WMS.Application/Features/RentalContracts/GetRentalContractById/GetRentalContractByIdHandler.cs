@@ -1,0 +1,111 @@
+using MediatR;
+using WMS.Application.Features.RentalContracts.Common;
+using WMS.Application.Interfaces;
+using WMS.Domain.Interfaces;
+
+namespace WMS.Application.Features.RentalContracts.GetRentalContractById;
+
+public class GetRentalContractByIdHandler : IRequestHandler<GetRentalContractByIdQuery, RentalContractDto?>
+{
+    private readonly IRentalContractRepository _contractRepo;
+    private readonly IUserRepository _userRepo;
+    private readonly IWarehouseRepository _warehouseRepo;
+    private readonly IRentalRequestRepository _rentalRequestRepo;
+
+    public GetRentalContractByIdHandler(
+        IRentalContractRepository contractRepo,
+        IUserRepository userRepo,
+        IWarehouseRepository warehouseRepo,
+        IRentalRequestRepository rentalRequestRepo)
+    {
+        _contractRepo = contractRepo;
+        _userRepo = userRepo;
+        _warehouseRepo = warehouseRepo;
+        _rentalRequestRepo = rentalRequestRepo;
+    }
+
+    public async Task<RentalContractDto?> Handle(
+        GetRentalContractByIdQuery request,
+        CancellationToken cancellationToken)
+    {
+        var contract = await _contractRepo.GetByIdWithDetailsAsync(request.ContractId);
+        if (contract == null) return null;
+
+        var warehouse = await _warehouseRepo.GetByIdAsync(contract.WarehouseId, cancellationToken);
+
+        // Only the renter or the warehouse owner can view the contract
+        var isRenter = contract.RenterId == request.UserId;
+        var isOwner = warehouse?.OwnerId == request.UserId;
+        if (!isRenter && !isOwner)
+            throw new UnauthorizedAccessException("Access denied");
+
+        var renter = await _userRepo.GetByIdAsync(contract.RenterId, cancellationToken);
+        var owner = warehouse != null
+            ? await _userRepo.GetByIdAsync(warehouse.OwnerId, cancellationToken)
+            : null;
+        var rentalRequest = await _rentalRequestRepo.GetByIdAsync(contract.RentalRequestId);
+
+        return new RentalContractDto
+        {
+            ContractId = contract.ContractId,
+            RentalRequestId = contract.RentalRequestId,
+            ContractNumber = contract.ContractNumber,
+            RenterId = contract.RenterId,
+            RenterName = renter?.FullName ?? "Unknown",
+            RenterEmail = renter?.Email ?? "",
+            RenterPhone = renter?.Phone,
+            OwnerName = owner?.FullName ?? "",
+            OwnerPhone = owner?.Phone,
+            OwnerEmail = owner?.Email,
+            WarehouseId = contract.WarehouseId,
+            WarehouseName = warehouse?.Name ?? "Unknown",
+            WarehouseAddress = warehouse?.Address ?? "",
+            RentalAreaId = rentalRequest?.RentalAreaId,
+            RequestedArea = rentalRequest?.RequestedArea ?? 0,
+            IsCustomArea = rentalRequest?.IsCustomArea ?? false,
+            IsOwnerAssigned = rentalRequest?.IsOwnerAssigned ?? false,
+            ProposedPositionX = rentalRequest?.ProposedPositionX,
+            ProposedPositionY = rentalRequest?.ProposedPositionY,
+            ProposedWidth = rentalRequest?.ProposedWidth,
+            ProposedLength = rentalRequest?.ProposedLength,
+            BaseRentalAreaId = rentalRequest?.BaseRentalAreaId,
+            // Extension zone (L-shape)
+            HasExtensionZone   = rentalRequest?.HasExtensionZone ?? false,
+            ExtensionPositionX = rentalRequest?.ExtensionPositionX,
+            ExtensionPositionY = rentalRequest?.ExtensionPositionY,
+            ExtensionWidth     = rentalRequest?.ExtensionWidth,
+            ExtensionLength    = rentalRequest?.ExtensionLength,
+            // Multi-zone
+            AdditionalZonesJson = rentalRequest?.AdditionalZonesJson,
+            StartDate = contract.StartDate,
+            EndDate = contract.EndDate,
+            MonthlyPayment = contract.MonthlyPayment,
+            TotalValue = contract.TotalValue,
+            DepositAmount = contract.DepositAmount,
+            Status = contract.Status,
+            Terms = contract.Terms,
+            ContractFileUrl = contract.ContractFileUrl,
+            SignedFileUrl = contract.SignedFileUrl,
+            ContractImageUrl = rentalRequest?.ContractImageUrl,
+            SignedAt = contract.SignedAt,
+            OwnerSignedFileUrl = contract.OwnerSignedFileUrl,
+            OwnerSignedAt = contract.OwnerSignedAt,
+            OwnerSignatureBase64 = contract.OwnerSignatureBase64,
+            RenterSignatureBase64 = contract.RenterSignatureBase64,
+            CreatedAt = contract.CreatedAt,
+            IsCurrentUserRenter = isRenter,
+            IsCurrentUserOwner = isOwner,
+            // 2-party approval fields
+            TerminationRequestedBy = contract.TerminationRequestedBy,
+            TerminationRequestedAt = contract.TerminationRequestedAt,
+            RenterApprovedTermination = contract.RenterApprovedTermination,
+            OwnerApprovedTermination = contract.OwnerApprovedTermination,
+            TerminationReason = contract.TerminationReason,
+            EarlyTerminationFee = contract.EarlyTerminationFee,
+            
+            // Payment Term mapping
+            MonthsPerTerm = contract.PaymentTerm?.MonthsPerTerm ?? 1,
+            AllowedOverdueDays = contract.PaymentTerm?.AllowedOverdueDays ?? 7
+        };
+    }
+}
